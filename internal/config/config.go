@@ -15,14 +15,19 @@ type Config struct {
 
 	EventsNATSURL string `envconfig:"EVENTS_NATS_URL" required:"true"`
 
-	RedisAddr string `envconfig:"REDIS_ADDR" required:"true"`
+	// RedisAddr: declared for the Part 3E caching layer, not yet wired into any
+	// code path — not required until a Redis client actually exists.
+	RedisAddr string `envconfig:"REDIS_ADDR"`
 
 	StalwartAdminURL      string `envconfig:"STALWART_ADMIN_URL" required:"true"`
 	StalwartAdminUser     string `envconfig:"STALWART_ADMIN_USER" default:"admin"`
 	StalwartAdminPassword string `envconfig:"STALWART_ADMIN_PASSWORD" required:"true"`
 
-	SubscriptionsAPIBaseURL string `envconfig:"SUBSCRIPTION_BASE_URL" required:"true"`
-	InternalServiceKey      string `envconfig:"INTERNAL_SERVICE_KEY" required:"true"`
+	// SubscriptionsAPIBaseURL / InternalServiceKey: declared for the future
+	// entitlement-lookup S2S calls (Part 3E), not yet called anywhere — not
+	// required until that client actually exists.
+	SubscriptionsAPIBaseURL string `envconfig:"SUBSCRIPTION_BASE_URL"`
+	InternalServiceKey      string `envconfig:"INTERNAL_SERVICE_KEY"`
 
 	SecurityJWKSURL string `envconfig:"SECURITY_JWKS_URL"`
 }
