@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 
 	sharedevents "github.com/Bengo-Hub/shared-events"
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 
@@ -17,10 +18,15 @@ import (
 )
 
 // Handler dispatches email.license.* and auth.user.deactivated events to the
-// Stalwart client.
+// Stalwart client, and publishes email.mailbox.* outbound events for others
+// to react to (plan Part 3E). email-provisioner owns no database, so these
+// are plain at-least-once NATS publishes, not the transactional outbox
+// pattern the DB-backed services use — there's no local transaction to tie
+// them to.
 type Handler struct {
 	log      *zap.Logger
 	stalwart *stalwart.Client
+	nats     *nats.Conn
 }
 
 // New builds the event handler.
@@ -33,6 +39,7 @@ func New(log *zap.Logger, stalwartClient *stalwart.Client) *Handler {
 // provides at-least-once delivery; handlers below are idempotent (Stalwart
 // operations tolerate "already exists"/"already disabled").
 func (h *Handler) Subscribe(conn *nats.Conn) error {
+	h.nats = conn
 	if _, err := sharedevents.QueueSubscribe(h.log, conn, "email.license.>", "mail-license-events", h.handleLicenseEvent); err != nil {
 		return err
 	}
@@ -40,6 +47,28 @@ func (h *Handler) Subscribe(conn *nats.Conn) error {
 		return err
 	}
 	return nil
+}
+
+// publishMailboxEvent emits an email.mailbox.* event. Best-effort: a failed
+// publish is logged, never fatal to the caller's own Stalwart operation,
+// which has already succeeded or failed on its own terms by this point.
+func (h *Handler) publishMailboxEvent(eventType string, tenantID uuid.UUID, email string, extra map[string]any) {
+	if h.nats == nil {
+		return
+	}
+	payload := map[string]any{"email": email}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	ev := sharedevents.NewEvent(eventType, "email", uuid.New(), tenantID, payload)
+	data, err := ev.ToJSON()
+	if err != nil {
+		h.log.Error("marshal outbound mailbox event failed", zap.String("event_type", eventType), zap.Error(err))
+		return
+	}
+	if err := h.nats.Publish(eventType, data); err != nil {
+		h.log.Error("publish outbound mailbox event failed", zap.String("event_type", eventType), zap.Error(err))
+	}
 }
 
 // licensePayload is the subset of EmailLicense/EmailPlan fields email-provisioner
@@ -90,17 +119,22 @@ func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
 		secret, err := h.stalwart.CreateMailbox(ctx, spec)
 		if err != nil {
 			h.log.Error("provision mailbox failed", zap.String("email", p.Email), zap.Error(err))
+			h.publishMailboxEvent("email.mailbox.provision_failed", ev.TenantID, p.Email, map[string]any{
+				"error": err.Error(),
+			})
 			return
 		}
 		if secret == "" {
 			h.log.Info("mailbox already provisioned, skipping", zap.String("email", p.Email))
 			return
 		}
-		// TODO(plan §13.2 "email-provisioner's outbound events"): this initial
-		// secret has nowhere to go yet — no email.mailbox.provisioned event,
-		// no notifications-api hookup to deliver a "set your password" link.
-		// Not lost (Stalwart has the real credential), just not yet handed to
-		// the end user by any automated path.
+		// The initial secret is intentionally NOT included in this event's
+		// payload — NATS events are at-least-once and can be replayed/logged
+		// by more than one consumer, which is the wrong exposure surface for
+		// a raw credential. Delivering it to the end user (a "set your
+		// password" link via notifications-api) is separate, not-yet-built
+		// work — this event only announces that provisioning succeeded.
+		h.publishMailboxEvent("email.mailbox.provisioned", ev.TenantID, p.Email, nil)
 		h.log.Info("mailbox provisioned", zap.String("email", p.Email))
 
 	case "license.upgraded":
