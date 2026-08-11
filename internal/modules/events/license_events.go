@@ -87,10 +87,20 @@ func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
 			MaxSendsPerMinute:   p.MaxSendsPerMinute,
 			MaxRecipientsPerDay: p.MaxRecipientsPerDay,
 		}
-		if err := h.stalwart.CreateMailbox(ctx, spec); err != nil {
+		secret, err := h.stalwart.CreateMailbox(ctx, spec)
+		if err != nil {
 			h.log.Error("provision mailbox failed", zap.String("email", p.Email), zap.Error(err))
 			return
 		}
+		if secret == "" {
+			h.log.Info("mailbox already provisioned, skipping", zap.String("email", p.Email))
+			return
+		}
+		// TODO(plan §13.2 "email-provisioner's outbound events"): this initial
+		// secret has nowhere to go yet — no email.mailbox.provisioned event,
+		// no notifications-api hookup to deliver a "set your password" link.
+		// Not lost (Stalwart has the real credential), just not yet handed to
+		// the end user by any automated path.
 		h.log.Info("mailbox provisioned", zap.String("email", p.Email))
 
 	case "license.upgraded":
