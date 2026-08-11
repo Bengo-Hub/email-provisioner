@@ -133,6 +133,26 @@ func (c *Client) CreateMailbox(ctx context.Context, spec MailboxSpec) (initialSe
 	return secret, nil
 }
 
+// QueueStats reports the outbound delivery queue depth — the one mail-specific
+// signal the platform's lightweight, non-Prometheus monitoring pattern
+// (auth-api's k8s.Client.Overview) can't get any other way. Confirmed live
+// against the real x:QueuedMessage/query method with calculateTotal.
+type QueueStats struct {
+	QueueDepth int `json:"queue_depth"`
+}
+
+func (c *Client) QueueStats(ctx context.Context) (QueueStats, error) {
+	res, err := c.call(ctx, "x:QueuedMessage/query", map[string]any{
+		"calculateTotal": true,
+		"limit":          0,
+	})
+	if err != nil {
+		return QueueStats{}, fmt.Errorf("query queue depth: %w", err)
+	}
+	total, _ := res["total"].(float64)
+	return QueueStats{QueueDepth: int(total)}, nil
+}
+
 // UpdateQuota changes an existing mailbox's storage quota (plan upgrade/downgrade).
 func (c *Client) UpdateQuota(ctx context.Context, email string, quotaBytes int64) error {
 	return c.patchAccount(ctx, email, map[string]any{

@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -57,6 +58,21 @@ func New(ctx context.Context) (*App, error) {
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	// Internal-only, unauthenticated (cluster-network-scoped, no Ingress exists
+	// for this service — see devops-k8s/apps/email-provisioner/values.yaml's
+	// ingress.enabled: false). Consumed by auth-api's lightweight platform
+	// monitoring dashboard (internal/clients/k8s/monitor.go), which otherwise
+	// has no way to see mail-specific signals like queue depth.
+	r.Get("/internal/mail-stats", func(w http.ResponseWriter, r *http.Request) {
+		stats, err := stalwartClient.QueueStats(r.Context())
+		if err != nil {
+			log.Error("mail-stats query failed", zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(stats)
 	})
 
 	return &App{
