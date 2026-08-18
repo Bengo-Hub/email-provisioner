@@ -8,6 +8,8 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
 	sharedevents "github.com/Bengo-Hub/shared-events"
 	"github.com/google/uuid"
@@ -15,7 +17,13 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bengobox/email-provisioner/internal/platform/stalwart"
+	"github.com/bengobox/email-provisioner/internal/platform/token"
 )
+
+// setupTokenTTL bounds how long a "choose your password" link stays valid —
+// long enough for a tenant admin to forward it, short enough that a stale
+// unused link isn't a standing risk.
+const setupTokenTTL = 72 * time.Hour
 
 // Handler dispatches email.license.* and auth.user.deactivated events to the
 // Stalwart client, and publishes email.mailbox.* outbound events for others
@@ -27,11 +35,26 @@ type Handler struct {
 	log      *zap.Logger
 	stalwart *stalwart.Client
 	nats     *nats.Conn
+
+	// Credential-delivery config — see config.go's ProvisioningTokenSecret
+	// comment for why a signed link, not a raw password, is what gets sent.
+	tokenSecret   string
+	mailUIBaseURL string
+	fromEmail     string
 }
 
-// New builds the event handler.
-func New(log *zap.Logger, stalwartClient *stalwart.Client) *Handler {
-	return &Handler{log: log, stalwart: stalwartClient}
+// New builds the event handler. tokenSecret/mailUIBaseURL/fromEmail wire the
+// credential-delivery flow (plan §13.2's flagged gap) — a freshly
+// provisioned mailbox's owner gets a signed "choose your password" link,
+// never the Stalwart-generated random initial secret itself.
+func New(log *zap.Logger, stalwartClient *stalwart.Client, tokenSecret, mailUIBaseURL, fromEmail string) *Handler {
+	return &Handler{
+		log:           log,
+		stalwart:      stalwartClient,
+		tokenSecret:   tokenSecret,
+		mailUIBaseURL: mailUIBaseURL,
+		fromEmail:     fromEmail,
+	}
 }
 
 // Subscribe registers all queue subscriptions on the given NATS connection.
@@ -83,6 +106,11 @@ type licensePayload struct {
 	MaxSendsPerHour     int    `json:"max_sends_per_hour"`
 	MaxSendsPerMinute   int    `json:"max_sends_per_minute"`
 	MaxRecipientsPerDay int    `json:"max_recipients_per_day"`
+	// NotifyEmail is the tenant admin's own already-reachable address,
+	// captured at assign time (subscriptions-api's email_handler.go, stored
+	// in EmailLicense.metadata) — deliberately NOT the new mailbox address
+	// itself, which its owner can't read yet.
+	NotifyEmail string `json:"notify_email"`
 }
 
 func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
@@ -131,11 +159,19 @@ func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
 		// The initial secret is intentionally NOT included in this event's
 		// payload — NATS events are at-least-once and can be replayed/logged
 		// by more than one consumer, which is the wrong exposure surface for
-		// a raw credential. Delivering it to the end user (a "set your
-		// password" link via notifications-api) is separate, not-yet-built
-		// work — this event only announces that provisioning succeeded.
+		// a raw credential. Delivering it to the end user is handled below
+		// instead, via a signed one-time "choose your password" link — the
+		// user picks their own password, so the random secret Stalwart just
+		// generated is never revealed to anyone at all.
 		h.publishMailboxEvent("email.mailbox.provisioned", ev.TenantID, p.Email, nil)
 		h.log.Info("mailbox provisioned", zap.String("email", p.Email))
+
+		if p.NotifyEmail != "" {
+			h.sendSetupNotification(ctx, ev.TenantID, p.Email, p.NotifyEmail)
+		} else {
+			h.log.Warn("mailbox provisioned with no notify_email — no setup link sent, owner has no known password yet",
+				zap.String("email", p.Email))
+		}
 
 	case "license.upgraded":
 		if err := h.stalwart.UpdateQuota(ctx, p.Email, int64(p.StorageQuotaGB)*1024*1024*1024); err != nil {
@@ -163,6 +199,36 @@ func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
 	default:
 		h.log.Debug("unhandled email.license event type", zap.String("event_type", ev.EventType))
 	}
+}
+
+// sendSetupNotification delivers a signed, time-limited "choose your
+// password" link for a freshly provisioned mailbox to its owner's existing,
+// already-reachable contact address. Best-effort: a delivery failure here
+// doesn't unwind the mailbox that was already successfully created — it's
+// logged so it can be re-sent manually, matching this bridge's existing
+// error-handling style elsewhere in this file.
+func (h *Handler) sendSetupNotification(ctx context.Context, tenantID uuid.UUID, mailboxEmail, notifyEmail string) {
+	setupToken := token.GenerateSetupToken(h.tokenSecret, mailboxEmail, setupTokenTTL)
+	setupURL := fmt.Sprintf("%s/setup?token=%s", h.mailUIBaseURL, setupToken)
+
+	subject := "Your Codevertex mailbox is ready"
+	body := fmt.Sprintf(
+		"Your new mailbox %s has been created.\n\n"+
+			"Choose your password here (link expires in 72 hours):\n%s\n\n"+
+			"If you weren't expecting this, you can ignore this message.",
+		mailboxEmail, setupURL,
+	)
+
+	if err := h.stalwart.SendSystemEmail(ctx, h.fromEmail, notifyEmail, subject, body); err != nil {
+		h.log.Error("send mailbox setup notification failed",
+			zap.String("mailbox", mailboxEmail), zap.String("notify_email", notifyEmail), zap.Error(err))
+		h.publishMailboxEvent("email.mailbox.setup_notification_failed", tenantID, mailboxEmail, map[string]any{
+			"notify_email": notifyEmail,
+			"error":        err.Error(),
+		})
+		return
+	}
+	h.log.Info("mailbox setup notification sent", zap.String("mailbox", mailboxEmail), zap.String("notify_email", notifyEmail))
 }
 
 func (h *Handler) handleUserDeactivated(msg *nats.Msg) {

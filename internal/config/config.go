@@ -23,6 +23,16 @@ type Config struct {
 	StalwartAdminUser     string `envconfig:"STALWART_ADMIN_USER" default:"admin"`
 	StalwartAdminPassword string `envconfig:"STALWART_ADMIN_PASSWORD" required:"true"`
 
+	// Credential-delivery (plan §13.2's flagged gap): rather than ever putting
+	// Stalwart's own randomly-generated initial mailbox secret on the wire
+	// (NATS is at-least-once/replayable, email isn't much better), a freshly
+	// provisioned mailbox gets a signed, time-limited "choose your password"
+	// link instead. ProvisioningTokenSecret must match mail-ui's own copy —
+	// see mail-ui/src/lib/setup-token.ts, which verifies the same HMAC.
+	ProvisioningTokenSecret string `envconfig:"PROVISIONING_TOKEN_SECRET" required:"true"`
+	MailUIBaseURL           string `envconfig:"MAIL_UI_BASE_URL" default:"https://webmail.codevertexafrica.com"`
+	PlatformFromEmail       string `envconfig:"PLATFORM_FROM_EMAIL" default:"no-reply@codevertexafrica.com"`
+
 	// SubscriptionsAPIBaseURL / InternalServiceKey: declared for the future
 	// entitlement-lookup S2S calls (Part 3E), not yet called anywhere — not
 	// required until that client actually exists.

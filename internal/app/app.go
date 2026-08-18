@@ -44,7 +44,7 @@ func New(ctx context.Context) (*App, error) {
 
 	stalwartClient := stalwart.New(cfg.StalwartAdminURL, cfg.StalwartAdminUser, cfg.StalwartAdminPassword)
 
-	handler := events.New(log, stalwartClient)
+	handler := events.New(log, stalwartClient, cfg.ProvisioningTokenSecret, cfg.MailUIBaseURL, cfg.PlatformFromEmail)
 	if err := handler.Subscribe(nc); err != nil {
 		nc.Close()
 		return nil, err

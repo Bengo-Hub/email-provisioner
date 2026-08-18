@@ -207,6 +207,135 @@ func (c *Client) ArchiveMailbox(ctx context.Context, email string) error {
 	return c.SuspendMailbox(ctx, email)
 }
 
+// SendSystemEmail sends a plain-text transactional message from an existing
+// Stalwart-hosted mailbox (normally the platform's no-reply@ address) via
+// standard JMAP mail submission — Email/set (create in Drafts) then
+// EmailSubmission/set. Two round trips rather than one JMAP request with a
+// result reference, since call() issues a single method call per request;
+// simplicity over one saved round trip for what's a low-volume operation.
+//
+// Kept inside this client (talking only to Stalwart, never a third service)
+// rather than routed through notifications-api — this bridge is meant to
+// stay "deliberately dumb" (plan Part 3E), and this is still just "talk to
+// Stalwart," only over its mail-submission API instead of its admin API.
+func (c *Client) SendSystemEmail(ctx context.Context, fromEmail, toEmail, subject, textBody string) error {
+	fromLocal, fromDomain, ok := strings.Cut(fromEmail, "@")
+	if !ok || fromDomain == "" {
+		return fmt.Errorf("invalid from address %q", fromEmail)
+	}
+	domainID, err := c.resolveDomainID(ctx, fromDomain)
+	if err != nil {
+		return err
+	}
+	accountID, err := c.findAccountIDByLocalPart(ctx, domainID, fromLocal, fromEmail)
+	if err != nil {
+		return err
+	}
+	if accountID == "" {
+		return fmt.Errorf("sender account %s not found in Stalwart", fromEmail)
+	}
+
+	identityID, err := c.firstIdentityID(ctx, accountID, fromEmail)
+	if err != nil {
+		return err
+	}
+	draftsID, sentID, err := c.draftsAndSentMailboxIDs(ctx, accountID, fromEmail)
+	if err != nil {
+		return err
+	}
+
+	bodyPartID := "b1"
+	createRes, err := c.call(ctx, "Email/set", map[string]any{
+		"accountId": accountID,
+		"create": map[string]any{
+			"msg1": map[string]any{
+				"mailboxIds": map[string]any{draftsID: true},
+				"from":       []map[string]any{{"email": fromEmail}},
+				"to":         []map[string]any{{"email": toEmail}},
+				"subject":    subject,
+				"bodyValues": map[string]any{bodyPartID: map[string]any{"value": textBody, "charset": "utf-8"}},
+				"textBody":   []map[string]any{{"partId": bodyPartID, "type": "text/plain"}},
+				"keywords":   map[string]any{"$draft": true},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create system email to %s: %w", toEmail, err)
+	}
+	created, _ := createRes["created"].(map[string]any)
+	msg1, _ := created["msg1"].(map[string]any)
+	emailID, _ := msg1["id"].(string)
+	if emailID == "" {
+		if notCreated, _ := createRes["notCreated"].(map[string]any); notCreated != nil {
+			return fmt.Errorf("system email to %s rejected: %v", toEmail, notCreated["msg1"])
+		}
+		return fmt.Errorf("system email to %s: no id in create response", toEmail)
+	}
+
+	submitArgs := map[string]any{
+		"accountId": accountID,
+		"create": map[string]any{
+			"sub1": map[string]any{"emailId": emailID, "identityId": identityID},
+		},
+	}
+	if sentID != "" {
+		submitArgs["onSuccessUpdateEmail"] = map[string]any{
+			emailID: map[string]any{
+				fmt.Sprintf("mailboxIds/%s", draftsID): nil,
+				fmt.Sprintf("mailboxIds/%s", sentID):   true,
+				"keywords/$draft":                      nil,
+			},
+		}
+	}
+	submitRes, err := c.call(ctx, "EmailSubmission/set", submitArgs)
+	if err != nil {
+		return fmt.Errorf("submit system email to %s: %w", toEmail, err)
+	}
+	if notCreated, _ := submitRes["notCreated"].(map[string]any); notCreated != nil {
+		if reason, ok := notCreated["sub1"]; ok {
+			return fmt.Errorf("submit system email to %s rejected: %v", toEmail, reason)
+		}
+	}
+	return nil
+}
+
+func (c *Client) firstIdentityID(ctx context.Context, accountID, email string) (string, error) {
+	res, err := c.call(ctx, "Identity/get", map[string]any{"accountId": accountID, "ids": nil})
+	if err != nil {
+		return "", fmt.Errorf("resolve identity for %s: %w", email, err)
+	}
+	list, _ := res["list"].([]any)
+	if len(list) == 0 {
+		return "", fmt.Errorf("no send identity found for %s", email)
+	}
+	first, _ := list[0].(map[string]any)
+	id, _ := first["id"].(string)
+	return id, nil
+}
+
+func (c *Client) draftsAndSentMailboxIDs(ctx context.Context, accountID, email string) (draftsID, sentID string, err error) {
+	res, err := c.call(ctx, "Mailbox/get", map[string]any{"accountId": accountID, "ids": nil})
+	if err != nil {
+		return "", "", fmt.Errorf("list mailboxes for %s: %w", email, err)
+	}
+	list, _ := res["list"].([]any)
+	for _, m := range list {
+		mm, _ := m.(map[string]any)
+		role, _ := mm["role"].(string)
+		id, _ := mm["id"].(string)
+		switch role {
+		case "drafts":
+			draftsID = id
+		case "sent":
+			sentID = id
+		}
+	}
+	if draftsID == "" {
+		return "", "", fmt.Errorf("no Drafts mailbox found for %s", email)
+	}
+	return draftsID, sentID, nil
+}
+
 func (c *Client) patchAccount(ctx context.Context, email string, patch map[string]any) error {
 	localPart, domainPart, ok := strings.Cut(email, "@")
 	if !ok || domainPart == "" {
@@ -343,7 +472,18 @@ func generateSecret() (string, error) {
 // JMAP-level "error" method response (e.g. unknownMethod, invalidArguments).
 func (c *Client) call(ctx context.Context, method string, args map[string]any) (map[string]any, error) {
 	reqBody := map[string]any{
-		"using":       []string{"urn:ietf:params:jmap:core", "urn:stalwart:jmap"},
+		// Declares both the vendor admin capability (x:Account/x:Domain, used
+		// throughout this file) and standard JMAP mail/submission (used by
+		// SendSystemEmail below) — broader than any single call strictly
+		// needs, but this client only ever issues one method call per
+		// request, so a single fixed capability list is simpler than
+		// threading a per-call "using" set through every caller.
+		"using": []string{
+			"urn:ietf:params:jmap:core",
+			"urn:ietf:params:jmap:mail",
+			"urn:ietf:params:jmap:submission",
+			"urn:stalwart:jmap",
+		},
 		"methodCalls": []any{[]any{method, args, "c1"}},
 	}
 	buf, err := json.Marshal(reqBody)
