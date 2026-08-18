@@ -29,7 +29,15 @@ type Config struct {
 	// provisioned mailbox gets a signed, time-limited "choose your password"
 	// link instead. ProvisioningTokenSecret must match mail-ui's own copy —
 	// see mail-ui/src/lib/setup-token.ts, which verifies the same HMAC.
-	ProvisioningTokenSecret string `envconfig:"PROVISIONING_TOKEN_SECRET" required:"true"`
+	//
+	// Deliberately NOT required: this is a new, additive feature — a
+	// not-yet-provisioned secret must degrade to "setup links aren't sent
+	// yet" (see the empty-secret guard in modules/events/license_events.go),
+	// never to "the whole bridge won't start." A required field here once
+	// crash-looped this service in production the moment this code deployed
+	// ahead of the Secret existing (2026-08-18) — do not reintroduce that
+	// failure mode by making any new, non-critical config required.
+	ProvisioningTokenSecret string `envconfig:"PROVISIONING_TOKEN_SECRET"`
 	MailUIBaseURL           string `envconfig:"MAIL_UI_BASE_URL" default:"https://webmail.codevertexafrica.com"`
 	PlatformFromEmail       string `envconfig:"PLATFORM_FROM_EMAIL" default:"no-reply@codevertexafrica.com"`
 

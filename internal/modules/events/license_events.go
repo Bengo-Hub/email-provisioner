@@ -208,6 +208,16 @@ func (h *Handler) handleLicenseEvent(msg *nats.Msg) {
 // logged so it can be re-sent manually, matching this bridge's existing
 // error-handling style elsewhere in this file.
 func (h *Handler) sendSetupNotification(ctx context.Context, tenantID uuid.UUID, mailboxEmail, notifyEmail string) {
+	if h.tokenSecret == "" {
+		// Additive feature, not yet provisioned in this environment — skip
+		// rather than sign a token with an empty/predictable secret. See
+		// config.go's ProvisioningTokenSecret comment: this must never be a
+		// required field, so this is the expected, safe steady-state until
+		// an operator sets the real value.
+		h.log.Warn("mailbox provisioned but PROVISIONING_TOKEN_SECRET is not configured — no setup link sent",
+			zap.String("mailbox", mailboxEmail))
+		return
+	}
 	setupToken := token.GenerateSetupToken(h.tokenSecret, mailboxEmail, setupTokenTTL)
 	setupURL := fmt.Sprintf("%s/setup?token=%s", h.mailUIBaseURL, setupToken)
 
