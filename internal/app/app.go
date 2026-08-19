@@ -81,6 +81,47 @@ func New(ctx context.Context) (*App, error) {
 		_ = json.NewEncoder(w).Encode(stats)
 	})
 
+	// Self-service custom-domain onboarding (plan Part 1.3) — called S2S by
+	// subscriptions-api, which never talks to Stalwart directly.
+	r.Post("/internal/domains", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Domain string `json:"domain"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Domain == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "domain is required"})
+			return
+		}
+		domainID, selector, zoneFile, err := stalwartClient.CreateDomain(r.Context(), body.Domain)
+		if err != nil {
+			log.Error("create domain failed", zap.String("domain", body.Domain), zap.Error(err))
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"stalwart_domain_id": domainID,
+			"dkim_selector":      selector,
+			"dns_zone_file":      zoneFile,
+		})
+	})
+
+	// Permanent mailbox hard-delete (plan Part 1.4) — platform-admin-only
+	// from mail-ui's side; this endpoint itself is cluster-internal/no-auth
+	// like every other /internal/* route here, so mail-ui's own admin gate
+	// (httpware.IsPlatformOwner) is the actual authorization boundary.
+	r.Delete("/internal/mailboxes/{email}", func(w http.ResponseWriter, r *http.Request) {
+		email := chi.URLParam(r, "email")
+		if err := stalwartClient.DestroyMailbox(r.Context(), email); err != nil {
+			log.Error("destroy mailbox failed", zap.String("email", email), zap.Error(err))
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	return &App{
 		cfg:  cfg,
 		log:  log,

@@ -195,6 +195,108 @@ func (c *Client) ReactivateMailbox(ctx context.Context, email string) (newSecret
 	return secret, nil
 }
 
+// DestroyMailbox permanently and irreversibly removes a mailbox account and
+// all its mail data — distinct from ArchiveMailbox/SuspendMailbox, which are
+// both reversible. Verb shape confirmed live 2026-08-19 via a real, disposable
+// create->destroy->verify-gone probe against a throwaway test account
+// (created, destroyed, confirmed notFound, cleaned up — nothing left behind):
+// x:Account/set {"destroy":[id]} -> {"destroyed":[id]}, synchronous (no async
+// task to poll — a follow-up x:Account/get immediately returned notFound).
+func (c *Client) DestroyMailbox(ctx context.Context, email string) error {
+	localPart, domainPart, ok := strings.Cut(email, "@")
+	if !ok || domainPart == "" {
+		return fmt.Errorf("invalid email %q", email)
+	}
+	domainID, err := c.resolveDomainID(ctx, domainPart)
+	if err != nil {
+		return err
+	}
+	accountID, err := c.findAccountIDByLocalPart(ctx, domainID, localPart, email)
+	if err != nil {
+		return err
+	}
+	if accountID == "" {
+		return fmt.Errorf("account %s not found in Stalwart", email)
+	}
+
+	res, err := c.call(ctx, "x:Account/set", map[string]any{
+		"destroy": []string{accountID},
+	})
+	if err != nil {
+		return fmt.Errorf("destroy mailbox %s: %w", email, err)
+	}
+	if notDestroyed, _ := res["notDestroyed"].(map[string]any); notDestroyed != nil {
+		if reason, ok := notDestroyed[accountID]; ok {
+			return fmt.Errorf("destroy mailbox %s rejected: %v", email, reason)
+		}
+	}
+	return nil
+}
+
+// CreateDomain provisions a new custom domain in Stalwart for self-service
+// tenant onboarding (plan Part 1.3) and returns its Stalwart id, the DKIM
+// selector to publish, and the full DNS zone-file text to show the tenant.
+// Stalwart's automatic DKIM management generates BOTH an ed25519 and an RSA
+// selector per domain (confirmed live via a disposable domain probe,
+// 2026-08-19) — extractDKIMSelector prefers the RSA one (universally
+// supported by receiving MTAs; ed25519 support is newer/less consistent).
+func (c *Client) CreateDomain(ctx context.Context, domain string) (stalwartDomainID, dkimSelector, dnsZoneFile string, err error) {
+	res, err := c.call(ctx, "x:Domain/set", map[string]any{
+		"create": map[string]any{"d1": map[string]any{"name": domain}},
+	})
+	if err != nil {
+		return "", "", "", fmt.Errorf("create domain %s: %w", domain, err)
+	}
+	created, _ := res["created"].(map[string]any)
+	d1, _ := created["d1"].(map[string]any)
+	id, _ := d1["id"].(string)
+	if id == "" {
+		if notCreated, _ := res["notCreated"].(map[string]any); notCreated != nil {
+			return "", "", "", fmt.Errorf("create domain %s rejected: %v", domain, notCreated["d1"])
+		}
+		return "", "", "", fmt.Errorf("create domain %s: no id returned", domain)
+	}
+
+	getRes, err := c.call(ctx, "x:Domain/get", map[string]any{"ids": []string{id}})
+	if err != nil {
+		return "", "", "", fmt.Errorf("fetch created domain %s: %w", domain, err)
+	}
+	list, _ := getRes["list"].([]any)
+	if len(list) == 0 {
+		return "", "", "", fmt.Errorf("created domain %s but could not fetch its zone file", domain)
+	}
+	item, _ := list[0].(map[string]any)
+	zoneFile, _ := item["dnsZoneFile"].(string)
+
+	c.mu.Lock()
+	c.domainIDs[domain] = id
+	c.mu.Unlock()
+
+	return id, extractDKIMSelector(zoneFile, domain), zoneFile, nil
+}
+
+// extractDKIMSelector scans a Stalwart-generated zone-file's text for the
+// first "<selector>._domainkey.<domain>." record, preferring one containing
+// "-rsa-" if more than one selector is present (see CreateDomain's comment).
+func extractDKIMSelector(zoneFile, domain string) string {
+	suffix := "._domainkey." + domain + "."
+	var fallback string
+	for _, line := range strings.Split(zoneFile, "\n") {
+		idx := strings.Index(line, suffix)
+		if idx <= 0 {
+			continue
+		}
+		selector := line[:idx]
+		if fallback == "" {
+			fallback = selector
+		}
+		if strings.Contains(selector, "-rsa-") {
+			return selector
+		}
+	}
+	return fallback
+}
+
 // ArchiveMailbox is called on email.license.expired after the grace period —
 // zeroes the disk quota (blocks new mail without deleting existing data) and
 // suspends submission, matching the original plan's Part 3E lifecycle.
