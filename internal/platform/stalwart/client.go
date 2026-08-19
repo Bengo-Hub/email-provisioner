@@ -153,6 +153,66 @@ func (c *Client) QueueStats(ctx context.Context) (QueueStats, error) {
 	return QueueStats{QueueDepth: int(total)}, nil
 }
 
+// MailboxUsage is one mailbox's real, live storage usage.
+type MailboxUsage struct {
+	Email         string `json:"email"`
+	UsedDiskQuota int64  `json:"used_disk_quota"`
+}
+
+// DomainUsageSummary is the real per-mailbox storage data plan Part 2b/5 (T4)
+// needs for the tenant dashboard's Storage Usage section — allocated quota is
+// already available from subscriptions-api's own EmailLicense rows, but real
+// *used* storage only exists in Stalwart, and tenant admins never touch
+// Stalwart directly (Access Model), so this is exposed as a small internal
+// endpoint for subscriptions-api to call S2S.
+type DomainUsageSummary struct {
+	MailboxCount int            `json:"mailbox_count"`
+	Mailboxes    []MailboxUsage `json:"mailboxes"`
+}
+
+// DomainUsageSummaryFor fetches every account's real usedDiskQuota (same
+// x:Account.usedDiskQuota field already proven live in mail-ui's admin
+// table) and scopes to the given domain client-side by emailAddress suffix —
+// x:Account/query's filter only matches name/description fields, never
+// emailAddress (confirmed in a prior session's admin-dashboard fix), so
+// there's no server-side domain filter to use instead.
+func (c *Client) DomainUsageSummaryFor(ctx context.Context, domain string) (DomainUsageSummary, error) {
+	res, err := c.call(ctx, "x:Account/query", map[string]any{})
+	if err != nil {
+		return DomainUsageSummary{}, fmt.Errorf("query accounts: %w", err)
+	}
+	ids, _ := res["ids"].([]any)
+	if len(ids) == 0 {
+		return DomainUsageSummary{}, nil
+	}
+
+	getRes, err := c.call(ctx, "x:Account/get", map[string]any{
+		"ids":        ids,
+		"properties": []string{"emailAddress", "usedDiskQuota"},
+	})
+	if err != nil {
+		return DomainUsageSummary{}, fmt.Errorf("fetch account usage: %w", err)
+	}
+	list, _ := getRes["list"].([]any)
+
+	suffix := "@" + strings.ToLower(domain)
+	out := DomainUsageSummary{Mailboxes: make([]MailboxUsage, 0, len(list))}
+	for _, item := range list {
+		account, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		email, _ := account["emailAddress"].(string)
+		if email == "" || !strings.HasSuffix(strings.ToLower(email), suffix) {
+			continue
+		}
+		used, _ := account["usedDiskQuota"].(float64)
+		out.Mailboxes = append(out.Mailboxes, MailboxUsage{Email: email, UsedDiskQuota: int64(used)})
+	}
+	out.MailboxCount = len(out.Mailboxes)
+	return out, nil
+}
+
 // UpdateQuota changes an existing mailbox's storage quota (plan upgrade/downgrade).
 func (c *Client) UpdateQuota(ctx context.Context, email string, quotaBytes int64) error {
 	return c.patchAccount(ctx, email, map[string]any{

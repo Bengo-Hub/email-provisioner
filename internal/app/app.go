@@ -107,6 +107,21 @@ func New(ctx context.Context) (*App, error) {
 		})
 	})
 
+	// Real per-mailbox storage usage for a domain (plan Part 2b/5, T4) — called
+	// S2S by subscriptions-api to feed the tenant dashboard's Storage Usage
+	// section, since tenant admins never talk to Stalwart directly.
+	r.Get("/internal/domains/{domain}/usage-summary", func(w http.ResponseWriter, r *http.Request) {
+		domain := chi.URLParam(r, "domain")
+		summary, err := stalwartClient.DomainUsageSummaryFor(r.Context(), domain)
+		if err != nil {
+			log.Error("domain usage summary failed", zap.String("domain", domain), zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(summary)
+	})
+
 	// Permanent mailbox hard-delete (plan Part 1.4) — platform-admin-only
 	// from mail-ui's side; this endpoint itself is cluster-internal/no-auth
 	// like every other /internal/* route here, so mail-ui's own admin gate
