@@ -42,10 +42,16 @@ func New(ctx context.Context) (*App, error) {
 		return nil, err
 	}
 
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		return nil, err
+	}
+
 	stalwartClient := stalwart.New(cfg.StalwartAdminURL, cfg.StalwartAdminUser, cfg.StalwartAdminPassword)
 
 	handler := events.New(log, stalwartClient, cfg.ProvisioningTokenSecret, cfg.MailUIBaseURL, cfg.PlatformFromEmail)
-	if err := handler.Subscribe(nc); err != nil {
+	if err := handler.Subscribe(nc, js); err != nil {
 		nc.Close()
 		return nil, err
 	}

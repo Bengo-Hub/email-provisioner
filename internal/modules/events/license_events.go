@@ -57,15 +57,38 @@ func New(log *zap.Logger, stalwartClient *stalwart.Client, tokenSecret, mailUIBa
 	}
 }
 
-// Subscribe registers all queue subscriptions on the given NATS connection.
-// Uses core QueueSubscribe (not JetStream) — subscriptions-api's outbox pattern
-// provides at-least-once delivery; handlers below are idempotent (Stalwart
-// operations tolerate "already exists"/"already disabled").
-func (h *Handler) Subscribe(conn *nats.Conn) error {
+// Subscribe registers all subscriptions on the given NATS connection.
+//
+// email.license.> is published by subscriptions-api's transactional outbox
+// via JetStream (subject-owning stream: "subscription", see that service's
+// internal/platform/events/nats.go RequiredSubjects) — a durable JetStream
+// queue consumer is required here, not core QueueSubscribe, or a redelivery
+// after a lost ack (or this pod being down when the event was published)
+// silently loses the event forever instead of retrying. auth.user.deactivated
+// stays on core QueueSubscribe: it's published as a plain core NATS message
+// by auth-api, not through any outbox/stream.
+func (h *Handler) Subscribe(conn *nats.Conn, js nats.JetStreamContext) error {
 	h.nats = conn
-	if _, err := sharedevents.QueueSubscribe(h.log, conn, "email.license.>", "mail-license-events", h.handleLicenseEvent); err != nil {
-		return err
-	}
+
+	const licenseDurable = "mail-license-events"
+	sharedevents.SubscribeQueueWithRebind(
+		h.log,
+		js,
+		"subscription", // stream that owns email.> per subscriptions-api's RequiredSubjects
+		"email.license.>",
+		licenseDurable,
+		func(msg *nats.Msg) {
+			h.handleLicenseEvent(msg)
+			_ = msg.Ack()
+		},
+		nats.Durable(licenseDurable),
+		nats.AckExplicit(),
+		nats.DeliverNew(),
+		nats.MaxDeliver(5),
+		nats.AckWait(30*time.Second),
+		nats.ManualAck(),
+	)
+
 	if _, err := sharedevents.QueueSubscribe(h.log, conn, "auth.user.deactivated", "mail-user-deactivated", h.handleUserDeactivated); err != nil {
 		return err
 	}
